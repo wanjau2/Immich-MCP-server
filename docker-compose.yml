@@ -1,0 +1,32 @@
+name: immich-mcp
+
+services:
+  immich-mcp:
+    build: .
+    image: immich-mcp:local
+    container_name: immich_mcp
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # Bind to localhost only. Cloudflare Tunnel reaches it over the Docker
+      # network, so there is no reason to publish this on the LAN.
+      # If cloudflared runs outside Docker, change to "8099:8080".
+      - "127.0.0.1:8099:8080"
+    #networks:
+      #- immich-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+#networks:
+  # Attach to the network Immich already created so the container can reach
+  # http://immich_server:2283 by name.
+  #
+  # Find the real name with:  docker network ls | grep immich
+  # It is usually <compose-project>_default, e.g. immich_default.
+ # immich-net:
+    #external: true
+    #name: immich_default

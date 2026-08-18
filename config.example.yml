@@ -1,0 +1,30 @@
+# Example ingress block for an existing cloudflared tunnel.
+#
+# If you manage the tunnel from the Cloudflare Zero Trust dashboard instead of
+# a config file, add a Public Hostname there with the same values:
+#   Subdomain : immich-mcp
+#   Domain    : example.com
+#   Service   : http://immich_mcp:8080
+#
+# Do NOT put a Cloudflare Access policy in front of this hostname. ChatGPT
+# cannot complete an interactive Access login; the bearer token is the gate.
+
+tunnel: <your-tunnel-uuid>
+credentials-file: /etc/cloudflared/<your-tunnel-uuid>.json
+
+ingress:
+  - hostname: immich-mcp.example.com
+    # Container name when cloudflared shares the Docker network.
+    # If cloudflared runs on the NAS host instead, use http://127.0.0.1:8099
+    service: http://immich_mcp:8080
+    originRequest:
+      # MCP streams responses. Disable buffering and allow long-lived requests.
+      disableChunkedEncoding: false
+      connectTimeout: 30s
+      noTLSVerify: false
+
+  # Your existing Immich hostname, for reference.
+  - hostname: photos.example.com
+    service: http://immich_server:2283
+
+  - service: http_status:404
