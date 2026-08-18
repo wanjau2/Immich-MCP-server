@@ -12,6 +12,7 @@ Upstream  : Immich REST API, authenticated with x-api-key
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -621,23 +622,87 @@ if ALLOW_SHARE_LINKS:
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Reject any request without the shared bearer token, except /healthz."""
+    """Authenticate every request against the shared token.
+
+    Three transports are accepted, because MCP clients differ in what they can
+    send:
+
+      1. Header   Authorization: Bearer <token>   (also X-API-Key: <token>)
+         ChatGPT custom connectors, Claude Code, Cursor, Zed, mcp-remote.
+
+      2. Path     https://host/<token>/mcp
+         Claude's connector UI only offers OAuth, so a header cannot be set.
+         The prefix is stripped before routing, so /<token>/mcp reaches /mcp.
+
+      3. Query    https://host/mcp?key=<token>
+         Fallback for tools that accept nothing but a bare URL.
+
+    Comparison is constant-time. The path and query forms are as strong as the
+    header form given a high-entropy token, but they do land in proxy logs and
+    shell history more readily — prefer the header where the client allows it.
+    """
 
     OPEN_PATHS = {"/healthz"}
+
+    @staticmethod
+    def _matches(candidate: str) -> bool:
+        return bool(candidate) and hmac.compare_digest(candidate, MCP_BEARER_TOKEN)
+
+    def _token_from_header(self, request) -> str | None:
+        header = request.headers.get("authorization", "")
+        scheme, _, value = header.partition(" ")
+        if scheme.lower() == "bearer" and self._matches(value.strip()):
+            return "header"
+        # Some clients send the raw token under X-API-Key instead.
+        if self._matches(request.headers.get("x-api-key", "").strip()):
+            return "header"
+        return None
+
+    def _token_from_query(self, request) -> str | None:
+        for param in ("key", "token", "api_key"):
+            if self._matches(request.query_params.get(param, "").strip()):
+                return "query"
+        return None
+
+    def _strip_path_token(self, request) -> str | None:
+        """If the first path segment is the token, remove it and return 'path'."""
+        path = request.scope.get("path", "")
+        parts = path.lstrip("/").split("/", 1)
+        if not parts or not self._matches(parts[0]):
+            return None
+
+        remainder = "/" + (parts[1] if len(parts) > 1 else "")
+        request.scope["path"] = remainder
+        # raw_path is bytes and takes precedence in some routers; keep it aligned.
+        if request.scope.get("raw_path"):
+            request.scope["raw_path"] = remainder.encode()
+        return "path"
 
     async def dispatch(self, request, call_next):
         if request.url.path in self.OPEN_PATHS:
             return await call_next(request)
 
-        header = request.headers.get("authorization", "")
-        scheme, _, token = header.partition(" ")
-        if scheme.lower() != "bearer" or token != MCP_BEARER_TOKEN:
-            log.warning("Rejected unauthenticated request to %s", request.url.path)
+        method = (
+            self._token_from_header(request)
+            or self._strip_path_token(request)
+            or self._token_from_query(request)
+        )
+
+        if method is None:
+            log.warning(
+                "Rejected unauthenticated %s %s", request.method, request.url.path
+            )
             return JSONResponse(
                 {"error": "unauthorized"},
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer"},
             )
+
+        # The path form also needs /healthz to work after stripping.
+        if request.scope.get("path") in self.OPEN_PATHS:
+            return await healthz(request)
+
+        log.debug("Authenticated via %s: %s", method, request.scope.get("path"))
         return await call_next(request)
 
 
@@ -664,3 +729,7 @@ app.add_middleware(BearerAuthMiddleware)
 log.info("Immich MCP server configured for %s", IMMICH_URL)
 log.info("Scope: %s", "restricted to " + ", ".join(ALLOWED_ALBUM_IDS) if SCOPED else "entire library")
 log.info("Share links: %s", "enabled" if ALLOW_SHARE_LINKS else "disabled")
+log.info(
+    "Auth accepted as: Authorization: Bearer <token>, X-API-Key: <token>, "
+    "path /<token>/mcp, or query /mcp?key=<token>"
+)

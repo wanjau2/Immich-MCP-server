@@ -67,13 +67,31 @@ Two layers are worth combining: scope the Immich API key to a dedicated user,
 *and* set `ALLOWED_ALBUM_IDS`. The key limits what this server could ever reach;
 the album list limits what it actually exposes.
 
+### Connecting different clients
+
+The server accepts the token three ways, because MCP clients differ in what they
+can send:
+
+| Client | URL | Auth |
+|---|---|---|
+| ChatGPT connector | `https://host/mcp` | `Authorization: Bearer <token>` |
+| Claude connector | `https://host/<token>/mcp` | leave OAuth fields blank |
+| Claude Code, Cursor, Zed | `https://host/mcp` | `--header` / config headers |
+| Anything URL-only | `https://host/mcp?key=<token>` | — |
+
+Claude's custom connector dialog offers only OAuth Client ID and Secret, which
+this server doesn't implement — hence the path form. Security is equivalent given
+a high-entropy token, but paths and query strings land in proxy logs and shell
+history more readily than headers, so prefer the header where the client allows
+it.
+
 ### Project layout
 
 ```
 immich-mcp/
 ├── Dockerfile
 ├── docker-compose.yml
-├── .env                  
+├── .env                  <- you create this, never commit it
 ├── .env.example
 ├── .dockerignore
 ├── preflight.py          <- validate config before building
