@@ -29,6 +29,29 @@ hence the tunnel — and it has to defend itself, hence the bearer token.
 | `server_info` | Immich version and enabled features |
 | `create_share_link` | Public link to specific assets — **off by default** |
 
+### Restricting access to specific albums
+
+By default the server exposes everything the API key can see. To share only a
+subset, put album UUIDs in `ALLOWED_ALBUM_IDS`:
+
+```bash
+python list_albums.py          # prints every album with its UUID
+```
+
+```ini
+ALLOWED_ALBUM_IDS=a1b2c3d4-...,e5f6g7h8-...
+```
+
+Every tool is then confined to assets inside those albums. Immich's smart search
+has no album filter, so the server builds the set of allowed asset IDs itself and
+drops anything outside it — including direct `fetch` by UUID, which returns a
+refusal rather than the asset. The set is cached for `SCOPE_TTL` seconds so
+photos added to an allowed album appear without a restart.
+
+Two layers are worth combining: scope the Immich API key to a dedicated user,
+*and* set `ALLOWED_ALBUM_IDS`. The key limits what this server could ever reach;
+the album list limits what it actually exposes.
+
 `search` and `fetch` are named deliberately: ChatGPT's Deep Research mode ignores
 every other tool, so those two carry the load if Developer Mode is unavailable.
 
@@ -60,7 +83,37 @@ It's usually `immich_default`. If the MCP container can't join it, set
 `IMMICH_URL` to the NAS LAN address instead (`http://192.168.1.50:2283`) and
 drop the `networks:` block.
 
-### 3. Build and run
+### 3. Test before Docker
+
+Two scripts validate everything without building an image:
+
+```bash
+pip install httpx python-dotenv
+python preflight.py
+```
+
+`preflight.py` checks the project layout, validates `.env`, opens a TCP
+connection to Immich, authenticates the API key, and reports which optional
+features (smart search, face recognition) are actually enabled. It names the
+exact fix for each failure.
+
+Once it passes, run the server with no Docker at all:
+
+```bash
+pip install -r app/requirements.txt
+python run_local.py
+```
+
+That serves on `http://127.0.0.1:8099` with auto-reload. In a second terminal:
+
+```bash
+python smoke_test.py http://127.0.0.1:8099 <your-bearer-token>
+```
+
+Much faster loop than rebuilding the image on every config change. Move to
+Docker once this passes.
+
+### 4. Build and run
 
 ```bash
 docker compose up -d --build
@@ -80,7 +133,7 @@ python smoke_test.py http://127.0.0.1:8099 <your-bearer-token>
 The smoke test runs the exact handshake ChatGPT does — initialize, tools/list,
 then a live tool call — and confirms unauthenticated requests get a 401.
 
-### 4. Expose through Cloudflare Tunnel
+### 5. Expose through Cloudflare Tunnel
 
 Add a public hostname to your existing tunnel pointing at
 `http://immich_mcp:8080`. See `cloudflared/config.example.yml`. If you manage the
@@ -95,7 +148,7 @@ Re-run the smoke test against the public URL:
 python smoke_test.py https://immich-mcp.example.com <your-bearer-token>
 ```
 
-### 5. Connect ChatGPT
+### 6. Connect ChatGPT
 
 Settings → Connectors → Advanced settings → enable **Developer Mode**
 (requires a paid plan), then Create:

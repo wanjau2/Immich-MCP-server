@@ -1,0 +1,9 @@
+
+.env
+.git
+.gitignore
+README.md
+smoke_test.py
+cloudflared/
+__pycache__/
+*.pyc

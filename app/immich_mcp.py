@@ -11,8 +11,10 @@ Upstream  : Immich REST API, authenticated with x-api-key
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -59,6 +61,21 @@ ALLOW_SHARE_LINKS = os.environ.get("ALLOW_SHARE_LINKS", "false").lower() == "tru
 # behind a tunnel or any load balancer. Set to false only if you need
 # resumable streams.
 STATELESS_HTTP = os.environ.get("STATELESS_HTTP", "true").lower() == "true"
+
+# Album scoping. Empty means the whole library is visible. Otherwise supply a
+# comma-separated list of album UUIDs and every tool is restricted to assets
+# inside those albums. Discover IDs with:  python list_albums.py
+_raw_albums = os.environ.get("ALLOWED_ALBUM_IDS", "").strip()
+ALLOWED_ALBUM_IDS: list[str] = [
+    a.strip() for a in _raw_albums.replace(";", ",").split(",") if a.strip()
+]
+SCOPED = bool(ALLOWED_ALBUM_IDS)
+
+# How long the scoped asset-ID set is cached before being rebuilt, in seconds.
+SCOPE_TTL = int(os.environ.get("SCOPE_TTL", "300"))
+
+# Backoff after a completely failed scope refresh, in seconds.
+SCOPE_RETRY = min(15, SCOPE_TTL)
 
 DEFAULT_PAGE_SIZE = int(os.environ.get("DEFAULT_PAGE_SIZE", "20"))
 MAX_PAGE_SIZE = int(os.environ.get("MAX_PAGE_SIZE", "100"))
@@ -112,6 +129,136 @@ def _clamp(size: int) -> int:
     return max(1, min(size, MAX_PAGE_SIZE))
 
 
+# --------------------------------------------------------------------------
+# Album scope
+# --------------------------------------------------------------------------
+#
+# Immich's smart search has no album filter, so scoping has to happen on this
+# side: build the set of asset IDs belonging to the allowed albums, then drop
+# anything outside it. The set is cached and rebuilt every SCOPE_TTL seconds so
+# newly added photos appear without a restart.
+
+
+class AlbumScope:
+    """Set of asset IDs the server is allowed to expose."""
+
+    def __init__(self, album_ids: list[str]) -> None:
+        self.album_ids = album_ids
+        self.asset_ids: set[str] = set()
+        self.person_ids: set[str] = set()
+        self.album_names: dict[str, str] = {}
+        # -inf, not 0.0: time.monotonic() starts near zero at process start, so
+        # 0.0 would make a never-loaded cache look fresh for the first
+        # SCOPE_TTL seconds of uptime and deny every request.
+        self.loaded_at: float = float("-inf")
+        self._lock = asyncio.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.album_ids)
+
+    async def refresh(self, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        if not force and (time.monotonic() - self.loaded_at) < SCOPE_TTL:
+            return
+
+        async with self._lock:
+            # Another coroutine may have refreshed while we waited.
+            if not force and (time.monotonic() - self.loaded_at) < SCOPE_TTL:
+                return
+
+            assets: set[str] = set()
+            people: set[str] = set()
+            names: dict[str, str] = {}
+
+            for album_id in self.album_ids:
+                try:
+                    album = await _call("GET", f"/albums/{album_id}")
+                except ImmichError as exc:
+                    log.error("Album %s unavailable, skipping: %s", album_id, exc)
+                    continue
+                names[album_id] = album.get("albumName") or album_id
+                for asset in album.get("assets", []):
+                    assets.add(asset["id"])
+                    for person in asset.get("people") or []:
+                        if person.get("id"):
+                            people.add(person["id"])
+
+            if not names:
+                # Every album failed to load. Do NOT cache this empty result for
+                # the full TTL, or a brief Immich hiccup silently blanks every
+                # search until it expires. Keep whatever we had and retry soon.
+                log.error(
+                    "Could not read any configured album. Keeping previous scope "
+                    "(%d assets) and retrying in %ds.",
+                    len(self.asset_ids),
+                    SCOPE_RETRY,
+                )
+                self.loaded_at = time.monotonic() - max(SCOPE_TTL - SCOPE_RETRY, 0)
+                return
+
+            self.asset_ids = assets
+            self.person_ids = people
+            self.album_names = names
+            self.loaded_at = time.monotonic()
+            if len(names) < len(self.album_ids):
+                log.warning(
+                    "Only %d of %d configured albums could be read.",
+                    len(names),
+                    len(self.album_ids),
+                )
+            log.info(
+                "Album scope refreshed: %d album(s), %d asset(s)",
+                len(names),
+                len(assets),
+            )
+
+    async def contains(self, asset_id: str) -> bool:
+        if not self.enabled:
+            return True
+        await self.refresh()
+        if asset_id in self.asset_ids:
+            return True
+        # Might be a photo added since the last refresh.
+        await self.refresh(force=True)
+        return asset_id in self.asset_ids
+
+    async def filter(self, assets: list[dict]) -> list[dict]:
+        if not self.enabled:
+            return assets
+        await self.refresh()
+        return [a for a in assets if a.get("id") in self.asset_ids]
+
+    def allows_album(self, album_id: str) -> bool:
+        return not self.enabled or album_id in self.album_ids
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "entire library"
+        return f"{len(self.album_names)} album(s): " + ", ".join(
+            self.album_names.values()
+        )
+
+
+scope = AlbumScope(ALLOWED_ALBUM_IDS)
+
+
+def _over_fetch(limit: int) -> int:
+    """When scoping, ask Immich for extra rows since many will be filtered out."""
+    if not scope.enabled:
+        return _clamp(limit)
+    return min(_clamp(limit) * 5, MAX_PAGE_SIZE * 5, 1000)
+
+
+async def _require_in_scope(asset_id: str) -> None:
+    if not await scope.contains(asset_id):
+        raise ImmichError(
+            f"Asset {asset_id} is outside the albums this server is allowed to "
+            f"access ({scope.describe()})."
+        )
+
+
 def _asset_url(asset_id: str) -> str:
     return f"{PUBLIC_URL}/photos/{asset_id}" if PUBLIC_URL else ""
 
@@ -158,6 +305,13 @@ def _summarize(asset: dict) -> dict:
 # MCP server
 # --------------------------------------------------------------------------
 
+_SCOPE_NOTE = (
+    " This server is restricted to a specific set of albums; anything outside "
+    "them is invisible and cannot be retrieved."
+    if SCOPED
+    else ""
+)
+
 mcp = FastMCP(
     name="immich",
     instructions=(
@@ -165,7 +319,7 @@ mcp = FastMCP(
         "Use `search` for content-based questions ('photos of a dog in snow'), "
         "`search_by_metadata` for date, place, camera, or person filters, and "
         "`fetch` to pull full EXIF for a single asset by UUID. "
-        "Asset IDs are UUIDs returned by the search tools."
+        "Asset IDs are UUIDs returned by the search tools." + _SCOPE_NOTE
     ),
 )
 
@@ -186,17 +340,24 @@ async def search(query: str, limit: int = DEFAULT_PAGE_SIZE) -> dict:
         "/search/smart",
         json={
             "query": query,
-            "size": _clamp(limit),
+            "size": _over_fetch(limit),
             "page": 1,
             "withExif": True,
         },
     )
     assets = payload["assets"]
-    return {
+    items = await scope.filter(assets.get("items", []))
+    items = items[: _clamp(limit)]
+    result = {
         "query": query,
-        "total": assets.get("total", 0),
-        "results": [_summarize(a) for a in assets.get("items", [])],
+        "results": [_summarize(a) for a in items],
     }
+    if scope.enabled:
+        result["scope"] = scope.describe()
+        result["total"] = len(items)
+    else:
+        result["total"] = assets.get("total", 0)
+    return result
 
 
 @mcp.tool()
@@ -206,6 +367,7 @@ async def fetch(id: str) -> dict:
     Returns EXIF detail: capture time, camera body and lens, exposure settings,
     dimensions, GPS coordinates, recognized people, and album membership.
     """
+    await _require_in_scope(id)
     asset = await _call("GET", f"/assets/{id}")
     exif = asset.get("exifInfo") or {}
 
@@ -290,7 +452,7 @@ async def search_by_metadata(
     asset_type is "IMAGE" or "VIDEO". Get person_ids from `list_people` first.
     Every argument is optional; omitting all of them returns the most recent assets.
     """
-    body: dict[str, Any] = {"size": _clamp(limit), "page": 1, "withExif": True}
+    body: dict[str, Any] = {"size": _over_fetch(limit), "page": 1, "withExif": True}
     optional = {
         "takenAfter": taken_after,
         "takenBefore": taken_before,
@@ -308,17 +470,28 @@ async def search_by_metadata(
 
     payload = await _call("POST", "/search/metadata", json=body)
     assets = payload["assets"]
-    return {
-        "filters": {k: v for k, v in body.items() if k not in ("size", "page", "withExif")},
-        "total": assets.get("total", 0),
-        "results": [_summarize(a) for a in assets.get("items", [])],
+    items = await scope.filter(assets.get("items", []))
+    items = items[: _clamp(limit)]
+    result = {
+        "filters": {
+            k: v for k, v in body.items() if k not in ("size", "page", "withExif")
+        },
+        "results": [_summarize(a) for a in items],
     }
+    if scope.enabled:
+        result["scope"] = scope.describe()
+        result["total"] = len(items)
+    else:
+        result["total"] = assets.get("total", 0)
+    return result
 
 
 @mcp.tool()
 async def list_albums() -> list[dict]:
     """List every album in the library with its name, asset count, and dates."""
     albums = await _call("GET", "/albums")
+    if scope.enabled:
+        albums = [a for a in albums if a["id"] in scope.album_ids]
     return [
         {
             "id": a["id"],
@@ -338,6 +511,11 @@ async def get_album(album_id: str, limit: int = 50) -> dict:
 
     Album IDs come from `list_albums`.
     """
+    if not scope.allows_album(album_id):
+        raise ImmichError(
+            f"Album {album_id} is outside the albums this server is allowed to "
+            f"access ({scope.describe()})."
+        )
     album = await _call("GET", f"/albums/{album_id}")
     assets = album.get("assets", [])
     return {
@@ -360,6 +538,11 @@ async def list_people(name: str = "", limit: int = 100) -> list[dict]:
     payload = await _call("GET", "/people", params={"size": 500})
     people = payload.get("people", []) if isinstance(payload, dict) else payload
     named = [p for p in people if p.get("name")]
+
+    if scope.enabled:
+        await scope.refresh()
+        named = [p for p in named if p["id"] in scope.person_ids]
+
     if name:
         needle = name.lower()
         named = [p for p in named if needle in p["name"].lower()]
@@ -368,7 +551,6 @@ async def list_people(name: str = "", limit: int = 100) -> list[dict]:
             "id": p["id"],
             "name": p.get("name"),
             "birthDate": p.get("birthDate"),
-            "thumbnailPath": None,
         }
         for p in named[:limit]
     ]
@@ -377,6 +559,14 @@ async def list_people(name: str = "", limit: int = 100) -> list[dict]:
 @mcp.tool()
 async def library_stats() -> dict:
     """Total photo count, video count, and disk usage for the library."""
+    if scope.enabled:
+        await scope.refresh()
+        return {
+            "scope": scope.describe(),
+            "albums": len(scope.album_names),
+            "assets": len(scope.asset_ids),
+            "note": "Counts cover only the albums this server may access.",
+        }
     try:
         return await _call("GET", "/server/statistics")
     except ImmichError:
@@ -405,6 +595,8 @@ if ALLOW_SHARE_LINKS:
             raise ImmichError("asset_ids cannot be empty.")
         if not PUBLIC_URL:
             raise ImmichError("PUBLIC_URL is not configured, cannot build a share URL.")
+        for asset_id in asset_ids:
+            await _require_in_scope(asset_id)
         result = await _call(
             "POST",
             "/shared-links",
@@ -453,7 +645,14 @@ async def healthz(request):
     """Liveness probe that also verifies the Immich connection."""
     try:
         version = await _call("GET", "/server/version")
-        return JSONResponse({"status": "ok", "immich": version})
+        body = {"status": "ok", "immich": version}
+        if scope.enabled:
+            await scope.refresh()
+            body["scope"] = {
+                "albums": list(scope.album_names.values()),
+                "assets": len(scope.asset_ids),
+            }
+        return JSONResponse(body)
     except ImmichError as exc:
         return JSONResponse({"status": "degraded", "detail": str(exc)}, status_code=503)
 
@@ -462,4 +661,6 @@ app = mcp.http_app(path="/mcp", stateless_http=STATELESS_HTTP)
 app.router.routes.append(Route("/healthz", healthz, methods=["GET"]))
 app.add_middleware(BearerAuthMiddleware)
 
-log.info("Immich MCP server configured for %s (share links: %s)", IMMICH_URL, ALLOW_SHARE_LINKS)
+log.info("Immich MCP server configured for %s", IMMICH_URL)
+log.info("Scope: %s", "restricted to " + ", ".join(ALLOWED_ALBUM_IDS) if SCOPED else "entire library")
+log.info("Share links: %s", "enabled" if ALLOW_SHARE_LINKS else "disabled")
