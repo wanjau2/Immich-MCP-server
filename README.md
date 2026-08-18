@@ -9,11 +9,23 @@ ChatGPT  ──HTTPS──▶  Cloudflare Tunnel  ──▶  immich_mcp:8080  �
           bearer token                        MCP → REST            x-api-key
 ```
 
-## Why it's built this way
+ChatGPT custom connectors only accept a **remote HTTPS endpoint** — there is no
+stdio or localhost option. So the server has to be reachable from the internet,
+hence the tunnel, and it has to defend itself, hence the bearer token.
 
-ChatGPT custom connectors only accept a **remote HTTPS endpoint**. There is no
-stdio or localhost option, so the server has to be reachable from the internet —
-hence the tunnel — and it has to defend itself, hence the bearer token.
+---
+
+## Contents
+
+- [Tools](#tools)
+- [Restricting access to specific albums](#restricting-access-to-specific-albums)
+- [Part 1 — Get it working on your laptop](#part-1--get-it-working-on-your-laptop)
+- [Part 2 — Deploy to the NAS](#part-2--deploy-to-the-nas)
+- [Part 3 — Expose it and connect ChatGPT](#part-3--expose-it-and-connect-chatgpt)
+- [Operating it](#operating-it)
+- [Troubleshooting](#troubleshooting)
+
+---
 
 ## Tools
 
@@ -28,6 +40,9 @@ hence the tunnel — and it has to defend itself, hence the bearer token.
 | `library_stats` | Photo/video counts and disk usage |
 | `server_info` | Immich version and enabled features |
 | `create_share_link` | Public link to specific assets — **off by default** |
+
+`search` and `fetch` are named deliberately: ChatGPT's Deep Research mode ignores
+every other tool, so those two carry the load if Developer Mode is unavailable.
 
 ### Restricting access to specific albums
 
@@ -52,17 +67,44 @@ Two layers are worth combining: scope the Immich API key to a dedicated user,
 *and* set `ALLOWED_ALBUM_IDS`. The key limits what this server could ever reach;
 the album list limits what it actually exposes.
 
-`search` and `fetch` are named deliberately: ChatGPT's Deep Research mode ignores
-every other tool, so those two carry the load if Developer Mode is unavailable.
+### Project layout
+
+```
+immich-mcp/
+├── Dockerfile
+├── docker-compose.yml
+├── .env                  
+├── .env.example
+├── .dockerignore
+├── preflight.py          <- validate config before building
+├── run_local.py          <- run without Docker, with auto-reload
+├── list_albums.py        <- discover album UUIDs for scoping
+├── smoke_test.py         <- full MCP handshake test
+├── cloudflared/
+│   └── config.example.yml
+└── app/
+    ├── immich_mcp.py
+    └── requirements.txt
+```
+
+`app/` matters. If those two files end up next to the Dockerfile instead of
+inside `app/`, the build fails with `"/app/immich_mcp.py": not found`.
 
 ---
 
-## Setup
+## Part 1 — Get it working on your laptop
+
+Optional, but a much faster loop than rebuilding an image for every config
+change. Everything here also works on the NAS.
 
 ### 1. Get an Immich API key
 
-Immich → Account Settings → API Keys → New API Key. Scope it read-only unless
-you plan to enable share links.
+Immich → Account Settings → API Keys → New API Key. Scope it read-only unless you
+plan to enable share links.
+
+Immich 3.x scopes keys per endpoint. The tools here need read access to assets,
+albums, people, and search. `/users/me` is *not* required — preflight reports a
+missing `user.read` scope as a warning, not a failure.
 
 ### 2. Configure
 
@@ -72,123 +114,294 @@ openssl rand -hex 32          # paste into MCP_BEARER_TOKEN
 $EDITOR .env
 ```
 
-Find the Docker network Immich already runs on and put its name in
-`docker-compose.yml` under `networks.immich-net.name`:
+From the laptop, `IMMICH_URL` must be the NAS **LAN address** — `immich_server`
+is a Docker container name that only resolves on the NAS itself:
 
-```bash
-docker network ls | grep -i immich
+```ini
+IMMICH_URL=http://192.168.0.43:2283
 ```
 
-It's usually `immich_default`. If the MCP container can't join it, set
-`IMMICH_URL` to the NAS LAN address instead (`http://192.168.1.50:2283`) and
-drop the `networks:` block.
+Note there's no second `http://`. A doubled scheme is an easy paste error and
+produces a confusing hostname failure.
 
-### 3. Test before Docker
-
-Two scripts validate everything without building an image:
+### 3. Preflight
 
 ```bash
 pip install httpx python-dotenv
 python preflight.py
 ```
 
-`preflight.py` checks the project layout, validates `.env`, opens a TCP
-connection to Immich, authenticates the API key, and reports which optional
-features (smart search, face recognition) are actually enabled. It names the
-exact fix for each failure.
+Checks the project layout, validates `.env`, opens a TCP connection to Immich,
+confirms the API key can read assets, and reports whether smart search and face
+recognition are actually enabled. It names the exact fix for each failure.
 
-Once it passes, run the server with no Docker at all:
+Worth reading the asset count it reports. If it says *1 asset visible* and your
+library has thousands, the key belongs to a user who owns almost nothing —
+everything downstream will work perfectly and return nothing.
+
+### 4. Run without Docker
 
 ```bash
 pip install -r app/requirements.txt
 python run_local.py
 ```
 
-That serves on `http://127.0.0.1:8099` with auto-reload. In a second terminal:
+Serves on `http://127.0.0.1:8099` with auto-reload. In a second terminal:
 
 ```bash
 python smoke_test.py http://127.0.0.1:8099 <your-bearer-token>
 ```
 
-Much faster loop than rebuilding the image on every config change. Move to
-Docker once this passes.
+This runs the exact handshake ChatGPT does — initialize, tools/list, then a live
+tool call — and confirms unauthenticated requests get a 401.
 
-### 4. Build and run
+### 5. Build the image (optional on the laptop)
+
+If you want to verify the Docker build before shipping it, delete the
+`networks:` block from `docker-compose.yml` first — `immich_default` only exists
+on the NAS.
 
 ```bash
 docker compose up -d --build
-docker compose logs -f immich-mcp
+curl.exe http://127.0.0.1:8099/healthz
 ```
 
-Verify locally before exposing anything:
+---
+
+## Part 2 — Deploy to the NAS
+
+Four things change: how the container reaches Immich, which Docker network it
+joins, file ownership, and how the image gets built.
+
+### 0. Rotate both secrets first
+
+If the Immich API key or bearer token has been pasted into a chat, an email, or a
+shared doc, treat it as burned. This endpoint is about to face the internet.
+
+- Immich → Account Settings → API Keys → delete the old one, create a new one
+- New bearer token: `openssl rand -hex 32`
+
+Do **not** copy your laptop `.env` across. It points `IMMICH_URL` at a LAN
+address, which works but routes photo metadata out to the LAN and back for no
+reason. Start from `.env.example` on the NAS.
+
+### 1. Copy the project across
+
+Put it alongside your other stacks, e.g. `/volume1/docker/immich-mcp/`. Either
+drag it in through File Station or:
+
+```powershell
+scp -r . wanjau@<nas-ip>:/volume1/docker/immich-mcp/
+```
+
+Verify `app/` survived — File Station drag-and-drop sometimes flattens
+directories:
 
 ```bash
-curl http://127.0.0.1:8099/healthz
-# {"status":"ok","immich":{"major":1,"minor":...}}
-
-pip install httpx
-python smoke_test.py http://127.0.0.1:8099 <your-bearer-token>
+ls -la /volume1/docker/immich-mcp/app/
 ```
 
-The smoke test runs the exact handshake ChatGPT does — initialize, tools/list,
-then a live tool call — and confirms unauthenticated requests get a 401.
+### 2. Find the real container name and network
 
-### 5. Expose through Cloudflare Tunnel
-
-Add a public hostname to your existing tunnel pointing at
-`http://immich_mcp:8080`. See `cloudflared/config.example.yml`. If you manage the
-tunnel from the Zero Trust dashboard, add it there instead.
-
-**Do not put Cloudflare Access in front of this hostname.** ChatGPT can't
-complete an interactive Access login.
-
-Re-run the smoke test against the public URL:
+SSH in (Control Panel → Terminal & SNMP → Enable SSH), then:
 
 ```bash
-python smoke_test.py https://immich-mcp.example.com <your-bearer-token>
+sudo docker ps --format '{{.Names}}\t{{.Image}}' | grep -i immich
+sudo docker network ls | grep -i immich
 ```
 
-### 6. Connect ChatGPT
+Container Manager often prefixes names with the project, so you may get
+`immich-immich_server-1` rather than `immich_server`. Prove the name resolves
+from *inside* Docker, which is what actually matters:
 
-Settings → Connectors → Advanced settings → enable **Developer Mode**
-(requires a paid plan), then Create:
+```bash
+sudo docker run --rm --network <network-name> curlimages/curl:latest \
+  -s -o /dev/null -w '%{http_code}\n' http://<container-name>:2283/api/server/version
+```
+
+A `200` here means the rest of this is boring. Skipping it means a tunnel 502
+later that looks like a Cloudflare problem but isn't.
+
+### 3. Write `.env` on the NAS
+
+```bash
+cd /volume1/docker/immich-mcp
+cp .env.example .env
+vi .env
+chmod 600 .env
+```
+
+Now `IMMICH_URL` uses the container name from step 2, keeping traffic inside
+Docker:
+
+```ini
+IMMICH_URL=http://immich_server:2283
+IMMICH_API_KEY=<the new key>
+MCP_BEARER_TOKEN=<the new token>
+PUBLIC_URL=https://photos.yourdomain.com
+ALLOWED_ALBUM_IDS=
+```
+
+### 4. Fix the network name and user
+
+In `docker-compose.yml`, set the network to whatever step 2 reported:
+
+```yaml
+networks:
+  immich-net:
+    external: true
+    name: immich_default        # <- from step 2
+```
+
+The Dockerfile creates a user with UID 1027, the usual Synology convention.
+Check yours with `id`; if it differs, either edit the Dockerfile or override in
+compose with `user: "1026:100"`. Only matters once you mount volumes — a
+mismatch is harmless for now.
+
+### 5. Preflight and pick albums, from inside a container
+
+DSM's Python is awkward to install packages into, and running preflight on the
+host wouldn't test container-to-container name resolution anyway:
+
+```bash
+cd /volume1/docker/immich-mcp
+sudo docker run --rm -it \
+  --network <network-name> \
+  -v "$PWD":/work -w /work \
+  python:3.12-slim sh -c "pip install -q httpx python-dotenv && python preflight.py"
+```
+
+Same one-liner runs `list_albums.py`. Copy the UUIDs you want exposed into
+`ALLOWED_ALBUM_IDS`.
+
+### 6. Build and start
+
+```bash
+sudo docker compose up -d --build
+sudo docker compose logs -f immich-mcp
+```
+
+Watch for three lines:
+
+```
+Immich MCP server configured for http://immich_server:2283
+Scope: restricted to <album-id>
+Album scope refreshed: 1 album(s), N asset(s)
+```
+
+If `N` is 0, the album ID is wrong or the key can't read that album.
+
+Container Manager GUI works too — Project → Create → point at the folder — but it
+sometimes struggles with `external: true` networks. Use SSH if it errors.
+
+### 7. Verify on the NAS before exposing anything
+
+```bash
+curl -s http://127.0.0.1:8099/healthz | head -c 300
+```
+
+Expect status ok, the Immich version, and your scope summary. Then the full
+handshake:
+
+```bash
+sudo docker run --rm -it --network host \
+  -v "$PWD":/work -w /work \
+  python:3.12-slim sh -c "pip install -q httpx && \
+    python smoke_test.py http://127.0.0.1:8099 <bearer-token>"
+```
+
+A problem found here is a config problem. The same problem found after the next
+section looks like a tunnel problem.
+
+---
+
+## Part 3 — Expose it and connect ChatGPT
+
+### 1. Add the Cloudflare Tunnel hostname
+
+Zero Trust dashboard → Networks → Tunnels → your tunnel → Public Hostname → Add:
+
+- **Subdomain**: `immich-mcp`
+- **Domain**: `yourdomain.com`
+- **Service**: `HTTP` → `immich_mcp:8080`
+
+If cloudflared runs as a container it must share a network with `immich_mcp` for
+that name to resolve; if it runs on the host, use `http://127.0.0.1:8099`. See
+`cloudflared/config.example.yml` for the config-file equivalent.
+
+**Do not attach an Access policy.** ChatGPT cannot complete an interactive Access
+login. The bearer token is the only gate — which is why rotating it mattered.
+
+Verify from off the LAN if you can; a phone hotspot is a good test:
+
+```powershell
+python smoke_test.py https://immich-mcp.yourdomain.com <bearer-token>
+```
+
+### 2. Create the connector
+
+Settings → Connectors → Advanced settings → enable **Developer Mode** (requires a
+paid plan), then Create:
 
 - **Name**: Immich Photos
 - **Description**: this matters — the model reads it to decide whether to invoke
   the connector. Something like *"Personal photo and video library. Use for
   finding, describing, or listing photos, albums, and recognized people."*
-- **URL**: `https://immich-mcp.example.com/mcp`
+- **URL**: `https://immich-mcp.yourdomain.com/mcp`
 - **Authentication**: API key / custom header → `Authorization: Bearer <token>`
 
-Then enable the connector in the chat composer.
+Then enable the connector in the chat composer and test with an explicit tool
+name:
+
+> Use immich search to find photos of the drying racks
 
 ---
 
-## Notes from actual use
+## Operating it
 
 **Name the tool in your prompt.** ChatGPT won't reliably guess when to reach for
 a custom connector. "Use immich search to find photos of the drying racks" works
 where "find my drying rack photos" often doesn't.
 
 **ChatGPT can't see your photos.** Tool results are text — descriptions and
-metadata, not pixels. `create_share_link` exists to bridge that gap, but a share
-link is public to anyone holding the URL, which is why it's disabled by default.
-Turn it on only if you're comfortable with that.
+metadata, not pixels. `create_share_link` bridges that gap, but a share link is
+public to anyone holding the URL, which is why it's disabled by default.
+
+**Updating code.** Edit `app/immich_mcp.py`, then `sudo docker compose up -d --build`.
+
+**Rotating the bearer token.** Edit `.env`, `docker compose up -d --force-recreate`,
+then update the connector in ChatGPT. There's a window where ChatGPT is broken —
+do it when you're not mid-conversation.
+
+**Adding photos to a scoped album.** Nothing to do. The scope cache rebuilds
+every `SCOPE_TTL` seconds (default 300).
+
+**Auto-start after a reboot.** `restart: unless-stopped` handles it, but
+Container Manager projects sometimes need auto-restart ticked in the GUI. Reboot
+once deliberately, at a time that suits you, rather than discovering it while
+you're away.
 
 **Pin your Immich version.** The API shifts between releases — `/server/statistics`
-was `/server-info/statistics` not long ago. Your own instance publishes the exact
-spec at `https://photos.example.com/api/docs`; check there before debugging a 404.
+was `/server-info/statistics` not long ago. Your instance publishes the exact spec
+at `https://photos.yourdomain.com/api/docs`; check there before debugging a 404.
 
-**Rotate the bearer token** by editing `.env` and running
-`docker compose up -d --force-recreate`, then updating the connector in ChatGPT.
+---
 
 ## Troubleshooting
 
 | Symptom | Cause |
 |---|---|
-| `/healthz` returns 503 | MCP container can't reach Immich — wrong `IMMICH_URL` or not on the same Docker network |
-| 401 on every request | Bearer token mismatch between `.env` and the connector config |
-| ChatGPT says "search action not found" | Connector was added in Deep Research mode; enable Developer Mode |
+| Build: `"/app/immich_mcp.py": not found`, context is 2 B | Files are flat; they belong in `app/` |
+| `network immich_default not found` | Wrong network name — redo Part 2 step 2 |
+| `/healthz` returns 503 | Can't reach Immich — wrong `IMMICH_URL`, or the containers aren't on the same network |
+| Container exits immediately | Missing required env var — check `docker compose logs` |
+| `Scope refreshed: 0 assets` | Album ID wrong, or the key can't read that album |
+| Preflight: API key rejected 403 on `/users/me` | Missing `user.read` scope — harmless, no tool needs it |
+| Preflight: only 1 asset visible | Key belongs to a user who owns almost nothing |
+| 401 on every request | Bearer token mismatch between `.env` and the connector |
+| Works on the NAS, 502 through the tunnel | cloudflared can't resolve `immich_mcp` — same network, or use the host IP |
+| Tunnel returns a login page | An Access policy is attached; remove it |
+| ChatGPT: "search action not found" | Added in Deep Research mode; enable Developer Mode |
 | Connector added but never fires | Description too vague, or the tool isn't toggled on in the chat |
-| `search` returns nothing ever | Immich machine learning is disabled — check `server_info` |
-| Immich rejects the key (401 in logs) | Key was revoked, or belongs to a different Immich user |
+| `search` returns nothing ever | Immich machine learning disabled — check `server_info` |
+| Immich rejects the key (401 in logs) | Key revoked, or belongs to a different Immich user |
