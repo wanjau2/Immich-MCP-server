@@ -12,6 +12,7 @@ Upstream  : Immich REST API, authenticated with x-api-key
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import logging
 import os
@@ -21,8 +22,9 @@ from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.utilities.types import Image
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 # --------------------------------------------------------------------------
@@ -57,6 +59,18 @@ PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 # Safety switch. Share links make photos publicly reachable to anyone holding
 # the URL, so the tool is off unless you deliberately turn it on.
 ALLOW_SHARE_LINKS = os.environ.get("ALLOW_SHARE_LINKS", "false").lower() == "true"
+
+# --- Image delivery -------------------------------------------------------
+# This server's own public base URL, e.g. https://cham-runda-nas.tailXXXX.ts.net
+# Required for get_image_link. Without it, only get_image (inline bytes) works.
+MCP_PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").rstrip("/")
+
+# Largest image returned inline by get_image, in bytes. Inline images are
+# base64-encoded into the model's context, so this should stay modest.
+MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(4 * 1024 * 1024)))
+
+# How long a signed image link stays valid, in seconds. Default 24 hours.
+IMAGE_LINK_TTL = int(os.environ.get("IMAGE_LINK_TTL", "86400"))
 
 # Stateless mode avoids server-side session affinity, which is what you want
 # behind a tunnel or any load balancer. Set to false only if you need
@@ -258,6 +272,64 @@ async def _require_in_scope(asset_id: str) -> None:
             f"Asset {asset_id} is outside the albums this server is allowed to "
             f"access ({scope.describe()})."
         )
+
+
+# --------------------------------------------------------------------------
+# Image delivery
+# --------------------------------------------------------------------------
+#
+# Two routes to the same pixels:
+#   get_image      -> raw bytes inline, for clients that can display images
+#   get_image_link -> a signed URL served by /img, for clients that cannot
+#
+# The signed URL carries its own proof, so /img bypasses the bearer check.
+# It is scoped to one asset, one size, and expires, which makes it far weaker
+# than the bearer token even though it needs no header.
+
+SIZE_ENDPOINTS = {
+    "thumbnail": "thumbnail",  # small square-ish, a few tens of KB
+    "preview": "preview",      # web-sized, a few hundred KB
+    "original": "original",    # full resolution, often several MB
+}
+
+
+def _sign_image(asset_id: str, size: str, expires: int) -> str:
+    payload = f"{asset_id}:{size}:{expires}".encode()
+    return hmac.new(MCP_BEARER_TOKEN.encode(), payload, hashlib.sha256).hexdigest()[:32]
+
+
+def _verify_image_sig(asset_id: str, size: str, expires: int, sig: str) -> bool:
+    return hmac.compare_digest(_sign_image(asset_id, size, expires), sig)
+
+
+async def _fetch_image_bytes(asset_id: str, size: str) -> tuple[bytes, str]:
+    """Return (bytes, content_type) for an asset at the requested size."""
+    if size not in SIZE_ENDPOINTS:
+        raise ImmichError(
+            f"Unknown size '{size}'. Use one of: {', '.join(SIZE_ENDPOINTS)}."
+        )
+
+    if size == "original":
+        path = f"/assets/{asset_id}/original"
+        params: dict[str, Any] = {}
+    else:
+        path = f"/assets/{asset_id}/thumbnail"
+        params = {"size": "preview" if size == "preview" else "thumbnail"}
+
+    try:
+        response = await client.get(path, params=params, headers={"Accept": "*/*"})
+    except httpx.RequestError as exc:
+        raise ImmichError(f"Could not reach Immich: {exc.__class__.__name__}") from exc
+
+    if response.status_code == 404:
+        raise ImmichError(f"No image data for asset {asset_id}.")
+    if response.status_code >= 400:
+        raise ImmichError(
+            f"Immich returned {response.status_code} fetching the {size} image."
+        )
+
+    content_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
+    return response.content, content_type
 
 
 def _asset_url(asset_id: str) -> str:
@@ -583,6 +655,70 @@ async def server_info() -> dict:
     return {"version": version, "features": features}
 
 
+@mcp.tool()
+async def get_image(id: str, size: str = "thumbnail") -> Image:
+    """Retrieve the actual image for an asset, returned inline.
+
+    Use this when you need to SEE a photo rather than read its metadata, for
+    example to describe its contents or answer a visual question about it.
+
+    size is "thumbnail" (small, fastest), "preview" (web-sized), or "original"
+    (full resolution, often several megabytes). Prefer thumbnail unless detail
+    matters. Not every client can display inline images; if yours cannot, use
+    `get_image_link` instead.
+    """
+    await _require_in_scope(id)
+    data, content_type = await _fetch_image_bytes(id, size)
+
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ImmichError(
+            f"The {size} image is {len(data) // 1024} KB, over the "
+            f"{MAX_IMAGE_BYTES // 1024} KB limit. Request a smaller size "
+            f"(thumbnail or preview), or use `get_image_link` for a URL."
+        )
+
+    fmt = content_type.removeprefix("image/") or "jpeg"
+    log.info("Returning %s image for %s (%d KB)", size, id, len(data) // 1024)
+    return Image(data=data, format=fmt)
+
+
+@mcp.tool()
+async def get_image_link(
+    id: str, size: str = "preview", expires_in_hours: int = 0
+) -> dict:
+    """Get a viewable URL for a photo, for opening in a browser.
+
+    Use this when the user wants to look at a photo themselves, or when inline
+    images are not supported. The link needs no login, works in any browser,
+    and expires. It points at one specific image at one specific size.
+
+    size is "thumbnail", "preview", or "original". expires_in_hours defaults to
+    the server's configured lifetime.
+    """
+    await _require_in_scope(id)
+
+    if size not in SIZE_ENDPOINTS:
+        raise ImmichError(
+            f"Unknown size '{size}'. Use one of: {', '.join(SIZE_ENDPOINTS)}."
+        )
+    if not MCP_PUBLIC_URL:
+        raise ImmichError(
+            "MCP_PUBLIC_URL is not configured, so image links cannot be built. "
+            "Set it to this server's public address, or use `get_image` instead."
+        )
+
+    ttl = (expires_in_hours * 3600) if expires_in_hours > 0 else IMAGE_LINK_TTL
+    expires = int(time.time()) + ttl
+    sig = _sign_image(id, size, expires)
+
+    return {
+        "url": f"{MCP_PUBLIC_URL}/img/{id}/{size}/{expires}/{sig}.jpg",
+        "size": size,
+        "expires_in_hours": round(ttl / 3600, 1),
+        "note": "Anyone with this link can view this one image until it expires.",
+    }
+
+
 if ALLOW_SHARE_LINKS:
 
     @mcp.tool()
@@ -643,6 +779,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     """
 
     OPEN_PATHS = {"/healthz"}
+    # Signed image links carry their own proof, so they skip the bearer check.
+    OPEN_PREFIXES = ("/img/",)
+
+    def _is_open(self, path: str) -> bool:
+        return path in self.OPEN_PATHS or path.startswith(self.OPEN_PREFIXES)
 
     @staticmethod
     def _matches(candidate: str) -> bool:
@@ -679,7 +820,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         return "path"
 
     async def dispatch(self, request, call_next):
-        if request.url.path in self.OPEN_PATHS:
+        if self._is_open(request.url.path):
             return await call_next(request)
 
         method = (
@@ -698,9 +839,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        # The path form also needs /healthz to work after stripping.
-        if request.scope.get("path") in self.OPEN_PATHS:
+        # The path form also needs open routes to work after stripping.
+        stripped = request.scope.get("path", "")
+        if stripped in self.OPEN_PATHS:
             return await healthz(request)
+        if stripped.startswith(self.OPEN_PREFIXES):
+            return await call_next(request)
 
         log.debug("Authenticated via %s: %s", method, request.scope.get("path"))
         return await call_next(request)
@@ -722,8 +866,56 @@ async def healthz(request):
         return JSONResponse({"status": "degraded", "detail": str(exc)}, status_code=503)
 
 
+async def serve_image(request):
+    """Serve one image against a signed, expiring URL. No bearer token needed.
+
+    The signature covers asset id, size, and expiry, so a leaked link exposes
+    exactly one image at one size for a bounded time.
+    """
+    p = request.path_params
+    asset_id, size, expires, sig = p["asset_id"], p["size"], p["expires"], p["sig"]
+
+    try:
+        expires_int = int(expires)
+    except ValueError:
+        return JSONResponse({"error": "bad link"}, status_code=400)
+
+    if not _verify_image_sig(asset_id, size, expires_int, sig):
+        log.warning("Bad image signature for %s", asset_id)
+        return JSONResponse({"error": "invalid or tampered link"}, status_code=403)
+
+    if time.time() > expires_int:
+        return JSONResponse({"error": "link expired"}, status_code=410)
+
+    # The signature proves the link was issued by us, but the album scope may
+    # have changed since. Re-check rather than trusting the old grant.
+    if not await scope.contains(asset_id):
+        return JSONResponse({"error": "asset no longer available"}, status_code=403)
+
+    try:
+        data, content_type = await _fetch_image_bytes(asset_id, size)
+    except ImmichError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={
+            "Cache-Control": "private, max-age=3600",
+            "Content-Disposition": f'inline; filename="{asset_id}.jpg"',
+        },
+    )
+
+
 app = mcp.http_app(path="/mcp", stateless_http=STATELESS_HTTP)
 app.router.routes.append(Route("/healthz", healthz, methods=["GET"]))
+app.router.routes.append(
+    Route(
+        "/img/{asset_id}/{size}/{expires}/{sig}.jpg",
+        serve_image,
+        methods=["GET", "HEAD"],
+    )
+)
 app.add_middleware(BearerAuthMiddleware)
 
 log.info("Immich MCP server configured for %s", IMMICH_URL)

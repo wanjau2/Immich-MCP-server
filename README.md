@@ -39,7 +39,33 @@ hence the tunnel, and it has to defend itself, hence the bearer token.
 | `list_people` | Recognized faces, with IDs for filtering |
 | `library_stats` | Photo/video counts and disk usage |
 | `server_info` | Immich version and enabled features |
+| `get_image` | The actual image, inline — for clients that can see pictures |
+| `get_image_link` | A signed, expiring URL to one image — for clients that can't |
 | `create_share_link` | Public link to specific assets — **off by default** |
+
+### Seeing the actual photos
+
+Most tools return text. Two return pixels:
+
+`get_image` sends the image bytes inline. Claude displays these and can answer
+visual questions about them. ChatGPT's connectors currently don't render inline
+images, so it's of little use there.
+
+`get_image_link` returns a URL like
+`https://your-server/img/<asset-id>/<size>/<expiry>/<signature>.jpg` that opens
+in any browser. This is the one that works with ChatGPT — the model hands you a
+link and you click it.
+
+The link carries an HMAC signature over the asset ID, size, and expiry, so it
+needs no bearer token. Tampering with any part returns 403, and the album scope
+is re-checked when the link is used rather than trusted from when it was issued.
+A leaked link therefore exposes exactly one image at one size until it expires
+(`IMAGE_LINK_TTL`, default 24 hours) — a far smaller blast radius than the
+bearer token.
+
+Set `MCP_PUBLIC_URL` to this server's public address or `get_image_link` can't
+build URLs. Sizes are `thumbnail`, `preview`, and `original`; `get_image` refuses
+anything over `MAX_IMAGE_BYTES` and suggests a smaller size.
 
 `search` and `fetch` are named deliberately: ChatGPT's Deep Research mode ignores
 every other tool, so those two carry the load if Developer Mode is unavailable.
