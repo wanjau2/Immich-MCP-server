@@ -19,6 +19,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 from fastmcp import FastMCP
@@ -370,7 +371,10 @@ def _sign_image(asset_id: str, size: str, expires: int) -> str:
 
 
 def _verify_image_sig(asset_id: str, size: str, expires: int, sig: str) -> bool:
-    return hmac.compare_digest(_sign_image(asset_id, size, expires), sig)
+    # Hex is case-insensitive; some clients normalise URL case.
+    return hmac.compare_digest(
+        _sign_image(asset_id, size, expires), sig.lower()
+    )
 
 
 async def _fetch_image_bytes(asset_id: str, size: str) -> tuple[bytes, str]:
@@ -966,15 +970,30 @@ async def serve_image(request):
     exactly one image at one size for a bounded time.
     """
     p = request.path_params
-    asset_id, size, expires, sig = p["asset_id"], p["size"], p["expires"], p["sig"]
+    # Clients sometimes deliver URLs with stray whitespace or percent-encoded
+    # spaces after wrapping. Normalise before verifying rather than failing.
+    asset_id = unquote(p["asset_id"]).strip().replace(" ", "")
+    size = unquote(p["size"]).strip()
+    expires = unquote(p["expires"]).strip()
+    sig = unquote(p["sig"]).strip()
 
     try:
         expires_int = int(expires)
     except ValueError:
+        log.warning("Image link with non-numeric expiry: %r", expires)
         return JSONResponse({"error": "bad link"}, status_code=400)
 
     if not _verify_image_sig(asset_id, size, expires_int, sig):
-        log.warning("Bad image signature for %s", asset_id)
+        log.warning(
+            "Bad image signature. asset=%r size=%r expires=%r "
+            "sig_received=%r sig_expected=%r raw_path=%r",
+            asset_id,
+            size,
+            expires,
+            sig,
+            _sign_image(asset_id, size, expires_int),
+            request.url.path,
+        )
         return JSONResponse({"error": "invalid or tampered link"}, status_code=403)
 
     if time.time() > expires_int:
