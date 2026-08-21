@@ -73,6 +73,11 @@ MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(4 * 1024 * 1024)))
 # How long a signed image link stays valid, in seconds. Default 24 hours.
 IMAGE_LINK_TTL = int(os.environ.get("IMAGE_LINK_TTL", "86400"))
 
+# Size used for the links embedded in every search result. "thumbnail" is
+# fastest and cheapest; "preview" is nicer to look at. Set to "none" to omit
+# links from results entirely.
+LINK_SIZE = os.environ.get("RESULT_LINK_SIZE", "preview").strip().lower()
+
 # Stateless mode avoids server-side session affinity, which is what you want
 # behind a tunnel or any load balancer. Set to false only if you need
 # resumable streams.
@@ -408,7 +413,19 @@ async def _fetch_image_bytes(asset_id: str, size: str) -> tuple[bytes, str]:
 
 
 def _asset_url(asset_id: str) -> str:
-    return f"{PUBLIC_URL}/photos/{asset_id}" if PUBLIC_URL else ""
+    """Best available link for one asset.
+
+    Prefers a signed link served by this server, since that works from any
+    client with no login. Falls back to Immich's own web UI if PUBLIC_URL is
+    set, which requires the viewer to be logged into Immich.
+    """
+    if MCP_PUBLIC_URL and LINK_SIZE in SIZE_ENDPOINTS:
+        expires = int(time.time()) + IMAGE_LINK_TTL
+        sig = _sign_image(asset_id, LINK_SIZE, expires)
+        return f"{MCP_PUBLIC_URL}/img/{asset_id}/{LINK_SIZE}/{expires}/{sig}.jpg"
+    if PUBLIC_URL:
+        return f"{PUBLIC_URL}/photos/{asset_id}"
+    return ""
 
 
 def _summarize(asset: dict) -> dict:
@@ -467,7 +484,11 @@ mcp = FastMCP(
         "Use `search` for content-based questions ('photos of a dog in snow'), "
         "`search_by_metadata` for date, place, camera, or person filters, and "
         "`fetch` to pull full EXIF for a single asset by UUID. "
-        "Asset IDs are UUIDs returned by the search tools." + _SCOPE_NOTE
+        "Asset IDs are UUIDs returned by the search tools. "
+        "Every search result includes a `url` field that opens the photo in a "
+        "browser — surface those links to the user directly rather than calling "
+        "another tool for them. Use `get_image` only when you need to look at "
+        "the picture yourself." + _SCOPE_NOTE
     ),
 )
 
@@ -480,8 +501,8 @@ async def search(query: str, limit: int = DEFAULT_PAGE_SIZE) -> dict:
     "dog running in snow", "whiteboard with a diagram", "sunset over water",
     "person holding a coffee cup".
 
-    Requires Immich machine learning to be enabled. Returns matching assets
-    ordered by relevance.
+    Each result carries a `url` that opens the photo in a browser — give those
+    to the user directly. Requires Immich machine learning to be enabled.
     """
     payload = await _call(
         "POST",
