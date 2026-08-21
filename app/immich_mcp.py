@@ -92,6 +92,12 @@ SCOPE_TTL = int(os.environ.get("SCOPE_TTL", "300"))
 # Backoff after a completely failed scope refresh, in seconds.
 SCOPE_RETRY = min(15, SCOPE_TTL)
 
+# Paging when enumerating a scoped album's contents.
+SCOPE_PAGE_SIZE = int(os.environ.get("SCOPE_PAGE_SIZE", "1000"))
+SCOPE_MAX_PAGES = int(os.environ.get("SCOPE_MAX_PAGES", "50"))
+# Above this many assets, stop collecting people (EXIF for every asset is slow).
+SCOPE_PEOPLE_LIMIT = int(os.environ.get("SCOPE_PEOPLE_LIMIT", "2000"))
+
 DEFAULT_PAGE_SIZE = int(os.environ.get("DEFAULT_PAGE_SIZE", "20"))
 MAX_PAGE_SIZE = int(os.environ.get("MAX_PAGE_SIZE", "100"))
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "30"))
@@ -154,6 +160,64 @@ def _clamp(size: int) -> int:
 # newly added photos appear without a restart.
 
 
+async def _album_asset_ids(album_id: str) -> tuple[set[str], set[str], bool]:
+    """Page through an album's assets via search/metadata.
+
+    Immich's GET /albums/{id} returns metadata only — no assets array — so the
+    contents have to be queried separately. Returns (asset_ids, person_ids,
+    people_complete); people are only collected for albums small enough that
+    pulling EXIF for every asset is reasonable.
+    """
+    asset_ids: set[str] = set()
+    person_ids: set[str] = set()
+    with_people = True
+    page = 1
+
+    while page <= SCOPE_MAX_PAGES:
+        body = {
+            "albumIds": [album_id],
+            "size": SCOPE_PAGE_SIZE,
+            "page": page,
+            "withExif": with_people,
+            "withPeople": with_people,
+        }
+        payload = await _call("POST", "/search/metadata", json=body)
+        assets = payload.get("assets", {})
+        items = assets.get("items", [])
+        if not items:
+            break
+
+        for asset in items:
+            asset_ids.add(asset["id"])
+            if with_people:
+                for person in asset.get("people") or []:
+                    if person.get("id"):
+                        person_ids.add(person["id"])
+
+        # Large albums: stop paying for EXIF/people once it is clearly big.
+        if with_people and len(asset_ids) > SCOPE_PEOPLE_LIMIT:
+            log.info(
+                "Album %s exceeds %d assets; skipping people collection.",
+                album_id,
+                SCOPE_PEOPLE_LIMIT,
+            )
+            with_people = False
+            person_ids.clear()
+
+        next_page = assets.get("nextPage")
+        if not next_page:
+            break
+        page += 1
+    else:
+        log.warning(
+            "Album %s hit the %d-page cap; scope may be incomplete.",
+            album_id,
+            SCOPE_MAX_PAGES,
+        )
+
+    return asset_ids, person_ids, with_people
+
+
 class AlbumScope:
     """Set of asset IDs the server is allowed to expose."""
 
@@ -161,6 +225,7 @@ class AlbumScope:
         self.album_ids = album_ids
         self.asset_ids: set[str] = set()
         self.person_ids: set[str] = set()
+        self.people_complete: bool = True
         self.album_names: dict[str, str] = {}
         # -inf, not 0.0: time.monotonic() starts near zero at process start, so
         # 0.0 would make a never-loaded cache look fresh for the first
@@ -186,6 +251,7 @@ class AlbumScope:
             assets: set[str] = set()
             people: set[str] = set()
             names: dict[str, str] = {}
+            people_complete = True
 
             for album_id in self.album_ids:
                 try:
@@ -194,11 +260,15 @@ class AlbumScope:
                     log.error("Album %s unavailable, skipping: %s", album_id, exc)
                     continue
                 names[album_id] = album.get("albumName") or album_id
-                for asset in album.get("assets", []):
-                    assets.add(asset["id"])
-                    for person in asset.get("people") or []:
-                        if person.get("id"):
-                            people.add(person["id"])
+
+                try:
+                    ids, persons, complete = await _album_asset_ids(album_id)
+                except ImmichError as exc:
+                    log.error("Could not list assets for %s: %s", album_id, exc)
+                    continue
+                assets |= ids
+                people |= persons
+                people_complete = people_complete and complete
 
             if not names:
                 # Every album failed to load. Do NOT cache this empty result for
@@ -215,6 +285,7 @@ class AlbumScope:
 
             self.asset_ids = assets
             self.person_ids = people
+            self.people_complete = people_complete
             self.album_names = names
             self.loaded_at = time.monotonic()
             if len(names) < len(self.album_ids):
@@ -541,6 +612,12 @@ async def search_by_metadata(
     if is_favorite is not None:
         body["isFavorite"] = is_favorite
 
+    # Immich can filter by album server-side, which beats over-fetching and
+    # discarding. The client-side scope filter below still runs as a backstop.
+    if scope.enabled:
+        body["albumIds"] = list(scope.album_ids)
+        body["size"] = _clamp(limit)
+
     payload = await _call("POST", "/search/metadata", json=body)
     assets = payload["assets"]
     items = await scope.filter(assets.get("items", []))
@@ -590,7 +667,20 @@ async def get_album(album_id: str, limit: int = 50) -> dict:
             f"access ({scope.describe()})."
         )
     album = await _call("GET", f"/albums/{album_id}")
-    assets = album.get("assets", [])
+
+    # Immich 3.x returns album metadata without an assets array, so query the
+    # contents separately.
+    payload = await _call(
+        "POST",
+        "/search/metadata",
+        json={
+            "albumIds": [album_id],
+            "size": _clamp(limit),
+            "page": 1,
+            "withExif": True,
+        },
+    )
+    assets = payload.get("assets", {}).get("items", [])
     return {
         "id": album["id"],
         "name": album.get("albumName"),
@@ -614,7 +704,10 @@ async def list_people(name: str = "", limit: int = 100) -> list[dict]:
 
     if scope.enabled:
         await scope.refresh()
-        named = [p for p in named if p["id"] in scope.person_ids]
+        if scope.people_complete:
+            named = [p for p in named if p["id"] in scope.person_ids]
+        # If people were not collected (album too large), fall through unfiltered
+        # rather than returning nothing.
 
     if name:
         needle = name.lower()
