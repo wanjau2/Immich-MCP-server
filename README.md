@@ -449,3 +449,7 @@ at `https://photos.yourdomain.com/api/docs`; check there before debugging a 404.
 | Connector added but never fires | Description too vague, or the tool isn't toggled on in the chat |
 | `search` returns nothing ever | Immich machine learning disabled — check `server_info` |
 | Immich rejects the key (401 in logs) | Key revoked, or belongs to a different Immich user |
+
+
+
+[![M8ven Verified](https://m8ven.ai/badge/mcp/wanjau2-immich-mcp-server-fr3r9i?variant=verified&v=60b9f970254b31253348b83e2d95a451)](https://m8ven.ai/mcp/wanjau2-immich-mcp-server-fr3r9i)
